@@ -2,7 +2,7 @@
 
 import socket
 
-SERVER_IP = '0.0.0.0'
+SERVER_IP = '0.0.0.0'  # Change this to the correct server IP if needed
 SERVER_PORT = 8080
 
 def start_tcp_client():
@@ -18,19 +18,31 @@ def start_tcp_client():
         # After connection, expect to receive authentication message from the server
         auth_message = client_socket.recv(1024)
         print(f"[INFO] Received authentication message from server: {auth_message.decode('utf-8')}")
-        
-        # Now you can send data to the server
-        message = "Hello, TCP Server! This is a message from the client."
-        print(f"[INFO] Sending message: {message}")
-        client_socket.sendall(message.encode('utf-8'))
 
-        # Receive response (optional)
-        response = client_socket.recv(1024)
-        print(f"[INFO] Received from server: {response.decode('utf-8')}")
-    
+        # Loop to take input from the user and send data to the server
+        while True:
+            message = input("Enter a message to send to the server (type 'exit' or '0' to quit): ")
+
+            if message.lower() == 'exit' or message == '0':
+                print("[INFO] Exiting and closing connection...")
+                break
+
+            # Send the message to the server
+            client_socket.sendall(message.encode('utf-8'))
+
+            # Optionally receive a response from the server
+            # response = client_socket.recv(1024)
+            # if response:
+            #     print(f"[INFO] Received from server: {response.decode('utf-8')}")
+
+
+    except Exception as e:
+        print(f"[ERROR] An error occurred: {e}")
+
     finally:
-        print("[INFO] Closing connection to the server.")
+        # Close the connection when done
         client_socket.close()
+        print("[INFO] Connection closed.")
 
 if __name__ == "__main__":
     start_tcp_client()
