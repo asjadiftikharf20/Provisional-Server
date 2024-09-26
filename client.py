@@ -1,8 +1,9 @@
 # client.py
 
 import socket
+import json
 
-SERVER_IP = '0.0.0.0'  # Change this to the correct server IP if needed
+SERVER_IP = '0.0.0.0'  # Replace with actual server IP if needed
 SERVER_PORT = 8080
 
 def start_tcp_client():
@@ -10,39 +11,40 @@ def start_tcp_client():
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     try:
-        # Initiate the connection to the server (this sends the SYN packet)
-        print(f"[INFO] Sending SYN packet to {SERVER_IP}:{SERVER_PORT}...")
-        client_socket.connect((SERVER_IP, SERVER_PORT))  # SYN-ACK handshake occurs here
-        print("[INFO] Connection established (SYN-ACK received).")
+        # Connect to the server
+        client_socket.connect((SERVER_IP, SERVER_PORT))
+        print(f"[INFO] Connected to {SERVER_IP}:{SERVER_PORT}")
 
-        # After connection, expect to receive authentication message from the server
-        auth_message = client_socket.recv(1024)
-        print(f"[INFO] Received authentication message from server: {auth_message.decode('utf-8')}")
+        # Receive connection number from the server
+        connection_number = client_socket.recv(1024).decode('utf-8')
+        print(f"[INFO] Assigned connection number: {connection_number}")
 
-        # Loop to take input from the user and send data to the server
+        client_id = f'client_{connection_number}'
+
+        # Loop for user input
         while True:
-            message = input("Enter a message to send to the server (type 'exit' or '0' to quit): ")
-
+            message = input("Enter a message (type 'exit' or '0' to quit): ")
             if message.lower() == 'exit' or message == '0':
-                print("[INFO] Exiting and closing connection...")
+                print("[INFO] Exiting client.")
                 break
 
-            # Send the message to the server
-            client_socket.sendall(message.encode('utf-8'))
+            # Prepare message in JSON format
+            client_info = json.dumps({
+                'client_id': client_id,
+                'connection_number': connection_number,
+                'message': message
+            })
 
-            # Optionally receive a response from the server
-            # response = client_socket.recv(1024)
-            # if response:
-            #     print(f"[INFO] Received from server: {response.decode('utf-8')}")
+            # Send the message
+            client_socket.sendall(client_info.encode('utf-8'))
 
-
-    except Exception as e:
-        print(f"[ERROR] An error occurred: {e}")
+            # Receive and print the server's response
+            response = client_socket.recv(1024)
+            print(f"[INFO] Received from server: {response.decode('utf-8')}")
 
     finally:
-        # Close the connection when done
+        # Close the socket connection
         client_socket.close()
-        print("[INFO] Connection closed.")
 
 if __name__ == "__main__":
     start_tcp_client()
