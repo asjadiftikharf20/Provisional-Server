@@ -1,114 +1,153 @@
 import socket
-import threading
 import logging
 import json
-from azure.iot.device import ProvisioningDeviceClient, IoTHubDeviceClient, Message
-
-from constant import HOST, PORT
+import threading
+from azure.iot.device import IoTHubDeviceClient, Message
+from azure.iot.hub import IoTHubRegistryManager
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]  # For Docker logs
+    handlers=[logging.StreamHandler()]
 )
 
-# Azure IoT DPS and IoT Hub credentials
-ID_SCOPE = "0ne00B2BFAE"
-DPS_GLOBAL_ENDPOINT = "global.azure-devices-provisioning.net"
+# IoT Hub connection string (replace with your actual connection string)
 IOTHUB_CONNECTION_STRING = "HostName=iothubdevuae.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=TgNmv49DIduLOsnHU7ccaESSOcXnpKu9UAIoTOMlm0s="
 
-# Unique connection number tracker
-connection_counter = 0
+# Store registered devices and their credentials (in-memory storage for now, can be DB for real-world scenario)
+registered_devices = {}
 
-# Provision device using Azure DPS
-def provision_device(device_id):
-    provisioning_host = DPS_GLOBAL_ENDPOINT
-    registration_id = device_id
-    symmetric_key = "Your Symmetric Key for Device"  # You will need to generate a symmetric key for each client
+def register_device_on_iot_hub(client_id):
+    registry_manager = IoTHubRegistryManager(IOTHUB_CONNECTION_STRING)
 
-    # Create provisioning client
-    provisioning_client = ProvisioningDeviceClient.create_from_symmetric_key(
-        provisioning_host=provisioning_host,
-        registration_id=registration_id,
-        id_scope=ID_SCOPE,
-        symmetric_key=symmetric_key
-    )
-
-    # Register the device
-    registration_result = provisioning_client.register()
-    logging.info(f"Registration result: {registration_result.status}")
-
-    if registration_result.status == 'assigned':
-        logging.info(f"Device {device_id} registered to IoT Hub {registration_result.registration_state.assigned_hub}")
-        return registration_result.registration_state.assigned_hub, registration_result.registration_state.device_id
-    else:
-        raise Exception(f"Failed to register device {device_id} with DPS.")
-
-# Send telemetry to IoT Hub
-def send_telemetry_to_iot_hub(iothub_device_client, telemetry_data):
-    message = Message(json.dumps(telemetry_data))
-    iothub_device_client.send_message(message)
-    logging.info(f"Sent telemetry data: {telemetry_data}")
-
-# Handle client connection
-def handle_client(client_socket, client_address):
-    global connection_counter
-    connection_counter += 1
-    connection_number = connection_counter
-    device_id = f"client_{connection_number}"
-
-    # Provision the device via DPS
+    # Check if the device is already registered
     try:
-        hub_name, device_id = provision_device(device_id)
+        device_info = registry_manager.get_device(client_id)
+        primary_key = device_info.authentication.symmetric_key.primary_key
+        secondary_key = device_info.authentication.symmetric_key.secondary_key
+        logging.info(f"Device {client_id} already registered. Fetching existing credentials.")
+        return primary_key, secondary_key
+    except Exception as e:
+        logging.info(f"Device {client_id} not found. Registering a new device.")
 
-        # Create IoT Hub client
-        iothub_device_client = IoTHubDeviceClient.create_from_connection_string(IOTHUB_CONNECTION_STRING)
+    # If not registered, create a new device with generated symmetric keys
+    try:
+        device = registry_manager.create_device_with_sas(client_id, None, None, None)
+        primary_key = device.authentication.symmetric_key.primary_key
+        secondary_key = device.authentication.symmetric_key.secondary_key
 
-        while True:
-            data = client_socket.recv(1024)
-            if not data:
-                break
+        # Store credentials for reuse
+        registered_devices[client_id] = (primary_key, secondary_key)
 
-            # Process the received data
-            received_message = data.decode('utf-8')
-            logging.info(f"Received from client {device_id}: {received_message}")
-
-            # Encapsulate data into JSON
-            telemetry_data = {
-                "connection_number": connection_number,
-                "client_ip": client_address[0],
-                "message": received_message
-            }
-
-            # Send telemetry to IoT Hub
-            send_telemetry_to_iot_hub(iothub_device_client, telemetry_data)
+        logging.info(f"Device {client_id} registered with IoT Hub. Primary Key: {primary_key}")
+        return primary_key, secondary_key
 
     except Exception as e:
-        logging.error(f"Error handling client {device_id}: {e}")
-    finally:
-        logging.info(f"Closing connection with {device_id}")
+        logging.error(f"Failed to register device {client_id}: {e}")
+        return None, None
+
+def send_telemetry_to_iot_hub(device_id, message):
+    try:
+        # Fetch the primary key for the device
+        primary_key = registered_devices[device_id][0]
+        
+        # Log the primary key without sending it to the client
+        logging.info(f"Primary key for device {device_id}: {primary_key}")
+        
+        # Create the IoTHubDeviceClient instance using the device credentials
+        device_client = IoTHubDeviceClient.create_from_symmetric_key(
+            symmetric_key=primary_key,
+            hostname="iothubdevuae.azure-devices.net",  # Update this with your IoT Hub Hostname
+            device_id=device_id,
+        )
+        
+        # Connect the client
+        device_client.connect()
+
+        # Prepare and send the telemetry message to IoT Hub (client ID and message only)
+        telemetry_message = Message(json.dumps({
+            'device_id': device_id,
+            'message': message
+        }))
+        device_client.send_message(telemetry_message)
+        logging.info(f"Telemetry message sent: {telemetry_message}")
+
+        # Disconnect the client after sending
+        device_client.disconnect()
+
+    except Exception as e:
+        logging.error(f"Failed to send telemetry from {device_id}: {e}")
+
+def handle_client_connection(client_socket, client_address):
+    logging.info(f"Connection established with {client_address}")
+
+    # Assign a client ID (for example: client_1, client_2, etc.)
+    client_id = f"client_{client_address[1]}"
+
+    # Register the device on IoT Hub and get credentials or use existing ones
+    primary_key, secondary_key = register_device_on_iot_hub(client_id)
+
+    if primary_key:
+        # Send only the client ID back to the client, not the primary key
+        client_info = json.dumps({
+            'device_id': client_id
+        })
+        client_socket.sendall(client_info.encode('utf-8'))
+        logging.info(f"Sent client_id {client_id} to client {client_address}")
+    else:
+        logging.error(f"Error handling client {client_id}: Failed to register or fetch device credentials")
         client_socket.close()
+        return
+
+    # Keep the connection open, waiting for telemetry
+    try:
+        while True:
+            data = client_socket.recv(1024)
+            if data:
+                message = data.decode('utf-8')
+                logging.info(f"Received data from {client_id}: {message}")
+
+                # Send the telemetry (client ID and message) to IoT Hub
+                send_telemetry_to_iot_hub(client_id, message)
+
+                # Send a response back to the client (optional)
+                client_socket.sendall(f"Telemetry received: {message}".encode('utf-8'))
+            else:
+                # No data received means the client closed the connection
+                logging.info(f"Client {client_id} disconnected.")
+                break
+
+    except Exception as e:
+        logging.error(f"Error receiving data from {client_id}: {e}")
+    
+    finally:
+        logging.info(f"Closing connection with {client_id}")
+        client_socket.close()
+
 
 def start_tcp_server():
     # Create and bind a TCP socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
+    
     try:
-        server_socket.bind((HOST, PORT))
-        logging.info(f"Server started on {HOST}:{PORT}")
+        server_socket.bind(('0.0.0.0', 8080))
+        logging.info("Server started on 0.0.0.0:8080")
     except OSError as e:
-        logging.error(f"Failed to bind to {HOST}:{PORT} - {e}")
+        logging.error(f"Failed to bind: {e}")
         return
 
-    server_socket.listen(5)
+    server_socket.listen(100)  # Listen for up to 100 connections
     logging.info("Server is listening for incoming connections...")
 
     while True:
+        logging.info("Waiting for a connection...")
+        
+        # Accept client connection
         client_socket, client_address = server_socket.accept()
-        logging.info(f"Connection established with {client_address}")
 
-        client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
+        # Handle each client in a new thread
+        client_thread = threading.Thread(target=handle_client_connection, args=(client_socket, client_address))
         client_thread.start()
 
 if __name__ == "__main__":
