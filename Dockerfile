@@ -21,4 +21,4 @@ COPY . /app
 EXPOSE 8080
 
 # Command to run the server
-CMD ["python", "server.py"]
+CMD ["python", "http_tcp_server.py"]

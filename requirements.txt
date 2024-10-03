@@ -1,2 +1,9 @@
 azure-iot-device
 azure-iot-hub
+requests
+asyncio
+uvloop
+aiohttp
+aioredis
+setuptools
+redis
