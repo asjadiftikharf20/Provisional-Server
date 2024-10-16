@@ -1,10 +1,10 @@
 import asyncio
-import uvloop
 import logging
 import json
-import aiohttp
 import time
-from aiohttp import web
+import aiohttp
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub import sastoken
 import redis.asyncio as redis
@@ -26,27 +26,30 @@ IOT_HUB_URL = "https://iothubdevuae.azure-devices.net/devices/{device_id}/messag
 # SAS token time limit (e.g., 1 hour)
 SAS_TOKEN_TIME_LIMIT = 3600
 
+# Create FastAPI instance
+app = FastAPI()
+
 # Redis connection (will be initialized in the start_server function)
 redis_client = None
-session = None  # Global aiohttp session
+aiohttp_session = None  # Global session for aiohttp
 
 async def create_sas_token(device_id, primary_key, expiry):
     """Create a new SAS token for the device."""
     resource_uri = f"{IOTHUB_CONNECTION_STRING.split(';')[0].split('=')[1]}/devices/{device_id}"
     sas_token = sastoken.SasToken(resource_uri, primary_key, ttl=expiry)
-    logging.info(f"Generated SAS token for {device_id}: {sas_token}")
     return str(sas_token)
 
 async def register_device_on_iot_hub(client_id):
     """Register a device on IoT Hub or fetch its existing credentials."""
     global redis_client
-    start_time = time.time()  # Start timing device registration
-    # Check if the device is already registered in Redis
     device_info = await redis_client.hgetall(client_id)
 
     if device_info:
         logging.info(f"Device {client_id} already registered.")
-        return device_info.get('primary_key'), device_info.get('secondary_key'), device_info.get('sas_token')
+        return (device_info['primary_key'], 
+                device_info['secondary_key'], 
+                device_info['sas_token'], 
+                device_info['token_expiry'])
 
     registry_manager = IoTHubRegistryManager(IOTHUB_CONNECTION_STRING)
 
@@ -64,46 +67,40 @@ async def register_device_on_iot_hub(client_id):
             logging.info(f"Device {client_id} registered successfully on IoT Hub.")
         except Exception as e:
             logging.error(f"Failed to register device {client_id}: {e}")
-            return None, None, None
+            return None, None, None, None
 
-    # Create a new SAS token for the device
     expiry = int(time.time()) + SAS_TOKEN_TIME_LIMIT
     sas_token = await create_sas_token(client_id, primary_key, expiry)
 
-    # Store the device credentials in Redis
     await redis_client.hset(client_id, mapping={
         'primary_key': primary_key,
         'secondary_key': secondary_key,
         'sas_token': sas_token,
-        'token_expiry': str(time.time() + SAS_TOKEN_TIME_LIMIT)
+        'token_expiry': str(expiry)
     })
 
-    # Set expiry in Redis for the stored data
     await redis_client.expire(client_id, SAS_TOKEN_TIME_LIMIT)
 
-    end_time = time.time()  # End timing device registration
-    logging.info(f"Device registration completed in {(end_time - start_time) * 1000:.2f} ms")
-
-    return primary_key, secondary_key, sas_token
+    return primary_key, secondary_key, sas_token, expiry
 
 async def send_telemetry_to_iot_hub(device_id, message):
     """Send telemetry data to IoT Hub."""
     try:
-        start_time = time.time()  # Start timing telemetry sending
         device_info = await redis_client.hgetall(device_id)
         if not device_info:
             logging.error(f"Device {device_id} not registered.")
             return
 
-        # Check if SAS token has expired
+        # Check and refresh SAS token if expired
         if time.time() > float(device_info['token_expiry']):
             logging.info(f"SAS token for device {device_id} expired. Generating new token.")
-            expiry = 86400  # 24 hours
+            expiry = SAS_TOKEN_TIME_LIMIT  # Maintain the original time limit
             sas_token = await create_sas_token(device_id, device_info['primary_key'], expiry)
-            await redis_client.hset(device_id, 'sas_token', sas_token)
-            await redis_client.hset(device_id, 'token_expiry', str(time.time() + expiry))
+            await redis_client.hset(device_id, mapping={
+                'sas_token': sas_token,
+                'token_expiry': str(time.time() + expiry)
+            })
 
-        url = IOT_HUB_URL.format(device_id=device_id)
         headers = {
             "Authorization": device_info['sas_token'],
             "Content-Type": "application/json"
@@ -114,68 +111,65 @@ async def send_telemetry_to_iot_hub(device_id, message):
             'message': message
         })
 
-        # Use an asynchronous context manager for the session post
-        async with session.post(url, headers=headers, data=telemetry_data) as response:
+        async with aiohttp_session.post(IOT_HUB_URL.format(device_id=device_id), headers=headers, data=telemetry_data) as response:
             if response.status == 204:
                 logging.info(f"Telemetry sent for device {device_id}")
             else:
                 logging.error(f"Failed to send telemetry. Status: {response.status}, Response: {await response.text()}")
 
-        end_time = time.time()  # End timing telemetry sending
-        logging.info(f"Telemetry sending completed in {(end_time - start_time) * 1000:.2f} ms")
-
     except Exception as e:
         logging.error(f"Error sending telemetry for device {device_id}: {e}")
 
-async def handle_post_request(request):
+@app.post("/")
+async def handle_post_request(data: dict):
     """Handle incoming POST requests, validate JSON, and send telemetry."""
     start_time = time.time()  # Start timing the request
     try:
-        data = await request.json()
-
         if 'device_id' not in data or 'time' not in data:
-            return web.json_response({'error': 'Invalid packet. Missing device_id or time.'}, status=400)
+            raise HTTPException(status_code=400, detail='Invalid packet. Missing device_id or time.')
 
         device_id = data['device_id']
 
         device_info = await register_device_on_iot_hub(device_id)
         if not device_info:
-            return web.json_response({'error': 'Failed to register device.'}, status=500)
+            raise HTTPException(status_code=500, detail='Failed to register device.')
 
         await send_telemetry_to_iot_hub(device_id, data)
 
         latency = (time.time() - start_time) * 1000  # Calculate latency in ms
         logging.info(f"Request handled in {latency:.2f} ms")
 
-        return web.json_response({'status': 'Telemetry received and sent to IoT Hub.'}, status=200)
+        return JSONResponse(content={'status': 'Telemetry received and sent to IoT Hub.'}, status_code=200)
 
     except json.JSONDecodeError:
-        return web.json_response({'error': 'Invalid JSON format.'}, status=400)
-
+        raise HTTPException(status_code=400, detail='Invalid JSON format.')
     except Exception as e:
         logging.error(f"Error handling request: {e}")
-        return web.json_response({'error': 'Internal Server Error'}, status=500)
+        raise HTTPException(status_code=500, detail='Internal Server Error')
 
-async def start_server():
-    """Start the aiohttp server and Redis connection."""
-    global redis_client, session
+async def start_redis_connection():
+    """Start the Redis connection."""
+    global redis_client
     pool = ConnectionPool(host='localhost', port=6379, max_connections=100, decode_responses=True)
     redis_client = redis.Redis(connection_pool=pool)
-    session = aiohttp.ClientSession()
 
-    app = web.Application()
-    app.router.add_post('/', handle_post_request)
+async def start_aiohttp_session():
+    """Start the aiohttp ClientSession."""
+    global aiohttp_session
+    aiohttp_session = aiohttp.ClientSession()
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
-    logging.info("Server started at http://0.0.0.0:8080")
+@app.on_event("startup")
+async def startup_event():
+    """Start Redis connection and aiohttp session when FastAPI app starts."""
+    await start_redis_connection()
+    await start_aiohttp_session()
 
-    while True:
-        await asyncio.sleep(3600)  # Keep the server running
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close Redis connection and aiohttp session when FastAPI app shuts down."""
+    await redis_client.close()
+    await aiohttp_session.close()
 
 if __name__ == "__main__":
-    # Set the event loop policy to use uvloop for better performance
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    asyncio.run(start_server())
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=9005)
