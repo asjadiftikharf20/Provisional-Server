@@ -9,6 +9,7 @@ from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub import sastoken
 import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
+from databases import Database
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +17,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
+
+DATABASE_URL = "postgresql://superuser:@localhost/teltonika_db"
+database = Database(DATABASE_URL)
 
 # IoT Hub connection string (replace with your actual connection string)
 IOTHUB_CONNECTION_STRING = "HostName=iothubdevuae.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=TgNmv49DIduLOsnHU7ccaESSOcXnpKu9UAIoTOMlm0s="
